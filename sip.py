@@ -376,44 +376,53 @@ class SyslogWorker(QThread):
 # ==========================================
 class SnmpWorker(QThread):
     status_signal = pyqtSignal(bool, str)
+    call_signal = pyqtSignal(str, str, str)
 
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.running = True
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.settimeout(0.5)
 
     def run(self):
         if not self.config.get("snmp_enabled", False):
             self.status_signal.emit(False, "SNMP Отключен")
             return
             
-        ip = self.config.get("snmp_ip", "192.168.1.100")
-        port = int(self.config.get("snmp_port", 161))
-        community = self.config.get("snmp_community", "public")
+        trap_port = 162
+        local_ip = self.config.get("local_ip", "0.0.0.0")
         
+        try:
+            self.socket.bind((local_ip, trap_port))
+            self.status_signal.emit(True, f"SNMP Trap Сервер запущен (Порт {trap_port})")
+        except Exception as error:
+            self.status_signal.emit(False, f"Ошибка SNMP порта: {error}")
+            return
+            
         while self.running:
             try:
-                errorIndication, errorStatus, errorIndex, varBinds = next(
-                    getCmd(SnmpEngine(),
-                           CommunityData(community, mpModel=1), 
-                           UdpTransportTarget((ip, port), timeout=2.0, retries=1),
-                           ContextData(),
-                           ObjectType(ObjectIdentity('1.3.6.1.2.1.1.1.0'))) 
-                )
+                data, addr = self.socket.recvfrom(65535)
+                # Попытка найти номера телефонов или строки в сыром SNMP Trap пакете
+                # (Поскольку OID могут быть проприетарными, ищем любые текстовые данные)
+                message = data.decode('ascii', errors='ignore')
                 
-                if errorIndication:
-                    self.status_signal.emit(False, f"SNMP: {errorIndication}")
-                elif errorStatus:
-                    self.status_signal.emit(False, f"SNMP: {errorStatus.prettyPrint()}")
-                else:
-                    self.status_signal.emit(True, f"SNMP: Устройство в сети")
-                    
+                # Ищем возможные номера или ключевые слова звонка
+                # В реальных условиях нужно парсить ASN.1, но для теста ищем паттерны
+                if "INVITE" in message or "RING" in message or "CALL" in message.upper():
+                    # Пытаемся извлечь номер (от 3 до 15 цифр)
+                    numbers = re.findall(r'\b\d{3,15}\b', message)
+                    if numbers:
+                        phone = numbers[0]
+                        self.call_signal.emit("IN", phone, "")
+                
+                print(f"Получен SNMP Trap от {addr}: {len(data)} байт")
+                
+            except socket.timeout:
+                continue
             except Exception as e:
-                self.status_signal.emit(False, f"SNMP: Ошибка")
-                
-            for _ in range(30):
-                if not self.running: break
-                self.msleep(100)
+                print(f"SNMP Error: {e}")
+                pass
 
 # ==========================================
 #      КРАСИВОЕ ОКНО (TELEGRAM STYLE)
@@ -946,10 +955,8 @@ class PhoneApp(QMainWindow):
         self.syslog_thread.start()
         
         self.snmp_thread = SnmpWorker(self.config)
-        # Мы можем выводить статус SNMP в тот же label или просто в консоль/трей.
-        # Для простоты выведем в консоль, чтобы не перетирать статус Syslog,
-        # либо можно объединить. Пока оставим так.
         self.snmp_thread.status_signal.connect(lambda ok, msg: print(msg))
+        self.snmp_thread.call_signal.connect(self.on_incoming_call)
         self.snmp_thread.start()
 
     def update_connection_status(self, is_ok, message):
