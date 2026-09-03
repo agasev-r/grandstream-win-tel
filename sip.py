@@ -26,6 +26,7 @@ import quopri
 try:
     import requests
     import psycopg2
+    from pysnmp.hlapi import *
     from psycopg2 import OperationalError
     from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                  QHBoxLayout, QPushButton, QLineEdit, QLabel, 
@@ -33,11 +34,11 @@ try:
                                  QSystemTrayIcon, QMenu, QDialog, QMessageBox, 
                                  QTabWidget, QFormLayout, QFrame, 
                                  QAbstractItemView, QInputDialog, QGraphicsDropShadowEffect,
-                                 QFileDialog)
+                                 QFileDialog, QComboBox)
     from PyQt6.QtGui import QIcon, QColor, QBrush, QPixmap, QPainter, QFont, QCursor
     from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QSharedMemory, QPropertyAnimation, QEasingCurve, QPoint, QRect
 except ImportError as e:
-    error_text = f"Не установлена нужная библиотека!\n\nДетали: {e}\n\nВыполните в консоли:\npip install PyQt6 psycopg2-binary requests"
+    error_text = f"Не установлена нужная библиотека!\n\nДетали: {e}\n\nВыполните в консоли:\npip install PyQt6 psycopg2-binary requests pysnmp"
     ctypes.windll.user32.MessageBoxW(0, error_text, "Ошибка импорта", 0x10)
     sys.exit(1)
 
@@ -53,6 +54,12 @@ def load_config():
         "phone_ext": "101",
         "local_ip": "0.0.0.0", 
         "syslog_port": 514,
+        
+        "snmp_enabled": False,
+        "snmp_ip": "192.168.1.100",
+        "snmp_port": 161,
+        "snmp_version": "v2c",
+        "snmp_community": "public",
         
         "pg_host": "127.0.0.1", 
         "pg_port": "5432", 
@@ -365,6 +372,50 @@ class SyslogWorker(QThread):
         self.is_talking = False
 
 # ==========================================
+#      SNMP РАБОЧИЙ ПОТОК (ОПРОС СТАТУСА)
+# ==========================================
+class SnmpWorker(QThread):
+    status_signal = pyqtSignal(bool, str)
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.running = True
+
+    def run(self):
+        if not self.config.get("snmp_enabled", False):
+            self.status_signal.emit(False, "SNMP Отключен")
+            return
+            
+        ip = self.config.get("snmp_ip", "192.168.1.100")
+        port = int(self.config.get("snmp_port", 161))
+        community = self.config.get("snmp_community", "public")
+        
+        while self.running:
+            try:
+                errorIndication, errorStatus, errorIndex, varBinds = next(
+                    getCmd(SnmpEngine(),
+                           CommunityData(community, mpModel=1), 
+                           UdpTransportTarget((ip, port), timeout=2.0, retries=1),
+                           ContextData(),
+                           ObjectType(ObjectIdentity('1.3.6.1.2.1.1.1.0'))) 
+                )
+                
+                if errorIndication:
+                    self.status_signal.emit(False, f"SNMP: {errorIndication}")
+                elif errorStatus:
+                    self.status_signal.emit(False, f"SNMP: {errorStatus.prettyPrint()}")
+                else:
+                    self.status_signal.emit(True, f"SNMP: Устройство в сети")
+                    
+            except Exception as e:
+                self.status_signal.emit(False, f"SNMP: Ошибка")
+                
+            for _ in range(30):
+                if not self.running: break
+                self.msleep(100)
+
+# ==========================================
 #      КРАСИВОЕ ОКНО (TELEGRAM STYLE)
 # ==========================================
 class TelegramPopup(QDialog):
@@ -506,6 +557,7 @@ class PhoneApp(QMainWindow):
         self.config = load_config()
         self.db = Database(self.config)
         self.syslog_thread = None
+        self.snmp_thread = None
         self.popup_window = None
         
         geo = self.config.get("window_geometry", [100, 100, 1250, 750])
@@ -882,12 +934,23 @@ class PhoneApp(QMainWindow):
         if self.syslog_thread:
             self.syslog_thread.running = False
             self.syslog_thread.wait()
+            
+        if self.snmp_thread:
+            self.snmp_thread.running = False
+            self.snmp_thread.wait()
         
         self.syslog_thread = SyslogWorker(self.config)
         self.syslog_thread.connection_status_signal.connect(self.update_connection_status)
         self.syslog_thread.call_signal.connect(self.on_incoming_call)
         self.syslog_thread.status_signal.connect(self.on_call_answered)
         self.syslog_thread.start()
+        
+        self.snmp_thread = SnmpWorker(self.config)
+        # Мы можем выводить статус SNMP в тот же label или просто в консоль/трей.
+        # Для простоты выведем в консоль, чтобы не перетирать статус Syslog,
+        # либо можно объединить. Пока оставим так.
+        self.snmp_thread.status_signal.connect(lambda ok, msg: print(msg))
+        self.snmp_thread.start()
 
     def update_connection_status(self, is_ok, message):
         color = "#2ecc71" if is_ok else "#e74c3c"
@@ -1016,6 +1079,30 @@ class PhoneApp(QMainWindow):
         lay_vnc.addStretch()
         tabs.addTab(tab_vnc, "🖥 База VNC")
 
+        tab_snmp = QWidget()
+        lay_snmp = QFormLayout(tab_snmp)
+        
+        from PyQt6.QtWidgets import QCheckBox
+        chk_snmp_en = QCheckBox("Включить SNMP Опрос")
+        chk_snmp_en.setChecked(current_cfg.get("snmp_enabled", False))
+        
+        in_snmp_ip = QLineEdit(current_cfg.get("snmp_ip", "192.168.1.100"))
+        in_snmp_port = QLineEdit(str(current_cfg.get("snmp_port", 161)))
+        
+        in_snmp_ver = QComboBox()
+        in_snmp_ver.addItems(["v1", "v2c"])
+        in_snmp_ver.setCurrentText(current_cfg.get("snmp_version", "v2c"))
+        
+        in_snmp_comm = QLineEdit(current_cfg.get("snmp_community", "public"))
+        
+        lay_snmp.addRow(chk_snmp_en)
+        lay_snmp.addRow("SNMP IP Телефона:", in_snmp_ip)
+        lay_snmp.addRow("SNMP Порт:", in_snmp_port)
+        lay_snmp.addRow("Версия:", in_snmp_ver)
+        lay_snmp.addRow("Комьюнити (Community):", in_snmp_comm)
+        
+        tabs.addTab(tab_snmp, "🌐 SNMP")
+
         main_layout.addWidget(tabs)
         
         btn_save = QPushButton("💾 Сохранить и Перезапустить Сервисы")
@@ -1029,7 +1116,12 @@ class PhoneApp(QMainWindow):
                 "pg_dbname": input_pg_dbname.text(), "pg_user": input_pg_user.text(), "pg_pass": input_pg_pass.text(),
                 "vnc_pg_host": in_v_host.text(), "vnc_pg_port": in_v_port.text(), "vnc_pg_dbname": in_v_name.text(),
                 "vnc_pg_user": in_v_user.text(), "vnc_pg_pass": in_v_pass.text(),
-                "vnc_owner": in_v_owner.text()
+                "vnc_owner": in_v_owner.text(),
+                "snmp_enabled": chk_snmp_en.isChecked(),
+                "snmp_ip": in_snmp_ip.text(),
+                "snmp_port": int(in_snmp_port.text()),
+                "snmp_version": in_snmp_ver.currentText(),
+                "snmp_community": in_snmp_comm.text()
             })
             save_config(current_cfg)
             self.db.config = current_cfg
@@ -1224,6 +1316,8 @@ class PhoneApp(QMainWindow):
         self.save_app_state()
         if self.syslog_thread:
             self.syslog_thread.running = False
+        if self.snmp_thread:
+            self.snmp_thread.running = False
         QApplication.quit()
 
 if __name__ == "__main__":
