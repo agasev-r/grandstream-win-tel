@@ -292,10 +292,9 @@ class SyslogWorker(QThread):
         self.is_talking = False
 
     def run(self):
-        ip_address = self.config.get("local_ip", "0.0.0.0")
         port = int(self.config.get("syslog_port", 514))
         try:
-            self.socket.bind((ip_address, port))
+            self.socket.bind(('0.0.0.0', port))
             self.connection_status_signal.emit(True, f"🟢 Активен (Порт {port})")
         except Exception as error:
             self.connection_status_signal.emit(False, f"🔴 Ошибка порта: {error}")
@@ -391,10 +390,9 @@ class SnmpWorker(QThread):
             return
             
         trap_port = 162
-        local_ip = self.config.get("local_ip", "0.0.0.0")
         
         try:
-            self.socket.bind((local_ip, trap_port))
+            self.socket.bind(('0.0.0.0', trap_port))
             self.status_signal.emit(True, f"SNMP Trap Сервер запущен (Порт {trap_port})")
         except Exception as error:
             self.status_signal.emit(False, f"Ошибка SNMP порта: {error}")
