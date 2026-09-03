@@ -279,7 +279,7 @@ class Database:
 # ==========================================
 class SyslogWorker(QThread):
     connection_status_signal = pyqtSignal(bool, str) 
-    call_signal = pyqtSignal(str, str, str) 
+    call_signal = pyqtSignal(str, str, str, str) 
     status_signal = pyqtSignal(str)         
 
     def __init__(self, config):
@@ -348,7 +348,8 @@ class SyslogWorker(QThread):
                         self.current_direction = direction
                         self.current_number = remote_party
                         self.is_talking = False
-                        self.call_signal.emit(direction, remote_party, "")
+                        # Для Syslog мы не всегда знаем локальный номер, передаем пустую строку
+                        self.call_signal.emit(direction, remote_party, "", "")
         
         if packet_call_id == self.active_call_id:
             if "SIP/2.0 200 OK" in message and ("CSeq: 1 INVITE" in message or "INVITE" in message):
@@ -365,7 +366,7 @@ class SyslogWorker(QThread):
                 if self.current_direction == "IN" and not self.is_talking:
                     final_status = "MISSED"
 
-                self.call_signal.emit(final_status, self.current_number, self.current_direction)
+                self.call_signal.emit(final_status, self.current_number, self.current_direction, "")
                 self.active_call_id = None
                 self.is_talking = False
 
@@ -386,10 +387,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             query = parse_qs(parsed_path.query)
             status = query.get('status', [''])[0]
             number = query.get('number', [''])[0]
+            local = query.get('local', [''])[0]
             direction = query.get('direction', ['IN'])[0]
             
             if hasattr(self.server, 'worker') and self.server.worker:
-                self.server.worker.handle_request(status, number, direction)
+                self.server.worker.handle_request(status, number, direction, local)
             
             self.send_response(200)
             self.send_header('Content-type', 'text/plain')
@@ -400,7 +402,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
 class HttpWorker(QThread):
-    call_signal = pyqtSignal(str, str, str)
+    call_signal = pyqtSignal(str, str, str, str)
     status_signal = pyqtSignal(str)
     connection_status_signal = pyqtSignal(bool, str)
 
@@ -410,9 +412,9 @@ class HttpWorker(QThread):
         self.running = True
         self.httpd = None
 
-    def handle_request(self, status, number, direction):
+    def handle_request(self, status, number, direction, local):
         if status in ["IN", "OUT", "END", "MISSED"]:
-            self.call_signal.emit(status, number, direction)
+            self.call_signal.emit(status, number, direction, local)
         elif status == "ANSWERED":
             self.status_signal.emit("ANSWERED")
 
@@ -433,69 +435,17 @@ class HttpWorker(QThread):
         self.httpd.server_close()
 
 # ==========================================
-#      SNMP РАБОЧИЙ ПОТОК (ОПРОС СТАТУСА)
-# ==========================================
-class SnmpWorker(QThread):
-    status_signal = pyqtSignal(bool, str)
-    call_signal = pyqtSignal(str, str, str)
-
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.running = True
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.settimeout(0.5)
-
-    def run(self):
-        if not self.config.get("snmp_enabled", False):
-            self.status_signal.emit(False, "SNMP Отключен")
-            return
-            
-        trap_port = 162
-        
-        try:
-            self.socket.bind(('0.0.0.0', trap_port))
-            self.status_signal.emit(True, f"SNMP Trap Сервер запущен (Порт {trap_port})")
-        except Exception as error:
-            self.status_signal.emit(False, f"Ошибка SNMP порта: {error}")
-            return
-            
-        while self.running:
-            try:
-                data, addr = self.socket.recvfrom(65535)
-                # Попытка найти номера телефонов или строки в сыром SNMP Trap пакете
-                # (Поскольку OID могут быть проприетарными, ищем любые текстовые данные)
-                message = data.decode('ascii', errors='ignore')
-                
-                # Ищем возможные номера или ключевые слова звонка
-                # В реальных условиях нужно парсить ASN.1, но для теста ищем паттерны
-                if "INVITE" in message or "RING" in message or "CALL" in message.upper():
-                    # Пытаемся извлечь номер (от 3 до 15 цифр)
-                    numbers = re.findall(r'\b\d{3,15}\b', message)
-                    if numbers:
-                        phone = numbers[0]
-                        self.call_signal.emit("IN", phone, "")
-                
-                print(f"Получен SNMP Trap от {addr}: {len(data)} байт")
-                
-            except socket.timeout:
-                continue
-            except Exception as e:
-                print(f"SNMP Error: {e}")
-                pass
-
-# ==========================================
 #      КРАСИВОЕ ОКНО (TELEGRAM STYLE)
 # ==========================================
 class TelegramPopup(QDialog):
     closed_signal = pyqtSignal()
 
-    def __init__(self, parent, call_type, number, name, info):
+    def __init__(self, parent, call_type, number, name, info, local=""):
         super().__init__(parent)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         
-        self.width_size, self.height_size = 360, 110
+        self.width_size, self.height_size = 380, 130
         self.setGeometry(0, 0, self.width_size, self.height_size)
         self.dragging = False
         self.offset = QPoint()
@@ -533,13 +483,23 @@ class TelegramPopup(QDialog):
         text_layout = QVBoxLayout()
         text_layout.setSpacing(2)
         
-        self.label_name = QLabel(name if name else "Неизвестный")
+        # Кто звонит (имя или номер)
+        caller_name = name if name else "Неизвестный"
+        self.label_name = QLabel(caller_name)
         self.label_name.setStyleSheet("font-size:13pt; font-weight:bold;")
         
-        self.label_phone = QLabel(number)
-        self.label_phone.setStyleSheet("font-size:11pt; opacity:0.8;")
+        # Детали звонка (Кто -> Кому)
+        details = f"📞 {number}"
+        if local:
+            details += f"  ➔  Кому: {local}"
+            
+        self.label_phone = QLabel(details)
+        self.label_phone.setStyleSheet("font-size:10pt; opacity:0.9;")
         
-        status_text = "Входящий звонок..." if call_type=="IN" else "Исходящий звонок..."
+        import datetime
+        current_time = datetime.datetime.now().strftime("%H:%M")
+        
+        status_text = f"Входящий звонок... [{current_time}]" if call_type=="IN" else f"Исходящий звонок... [{current_time}]"
         self.label_status = QLabel(status_text)
         self.label_status.setStyleSheet("font-size:10pt; font-style:italic;")
         
@@ -626,7 +586,6 @@ class PhoneApp(QMainWindow):
         self.config = load_config()
         self.db = Database(self.config)
         self.syslog_thread = None
-        self.snmp_thread = None
         self.http_thread = None
         self.popup_window = None
         
@@ -1005,10 +964,6 @@ class PhoneApp(QMainWindow):
             self.syslog_thread.running = False
             self.syslog_thread.wait()
             
-        if self.snmp_thread:
-            self.snmp_thread.running = False
-            self.snmp_thread.wait()
-            
         if self.http_thread:
             self.http_thread.running = False
             self.http_thread.wait()
@@ -1018,11 +973,6 @@ class PhoneApp(QMainWindow):
         self.syslog_thread.call_signal.connect(self.on_incoming_call)
         self.syslog_thread.status_signal.connect(self.on_call_answered)
         self.syslog_thread.start()
-        
-        self.snmp_thread = SnmpWorker(self.config)
-        self.snmp_thread.status_signal.connect(lambda ok, msg: print(msg))
-        self.snmp_thread.call_signal.connect(self.on_incoming_call)
-        self.snmp_thread.start()
         
         self.http_thread = HttpWorker(self.config)
         self.http_thread.connection_status_signal.connect(lambda ok, msg: print(msg))
@@ -1035,7 +985,7 @@ class PhoneApp(QMainWindow):
         self.connection_status.setText(message)
         self.connection_status.setStyleSheet(f"color: {color}; font-weight: bold; padding: 0 10px;")
 
-    def on_incoming_call(self, status, number, direction):
+    def on_incoming_call(self, status, number, direction, local=""):
         if status in ["END", "MISSED"]:
             if self.popup_window:
                 self.popup_window.close()
@@ -1049,7 +999,7 @@ class PhoneApp(QMainWindow):
         else:
             if self.popup_window: self.popup_window.close()
             info = self.db.find_contact_info(number)
-            self.popup_window = TelegramPopup(self, status, number, info[0] if info else None, "")
+            self.popup_window = TelegramPopup(self, status, number, info[0] if info else None, "", local)
             self.popup_window.closed_signal.connect(lambda: self.syslog_thread.force_reset())
             self.popup_window.show()
 
@@ -1157,30 +1107,6 @@ class PhoneApp(QMainWindow):
         lay_vnc.addStretch()
         tabs.addTab(tab_vnc, "🖥 База VNC")
 
-        tab_snmp = QWidget()
-        lay_snmp = QFormLayout(tab_snmp)
-        
-        from PyQt6.QtWidgets import QCheckBox
-        chk_snmp_en = QCheckBox("Включить SNMP Опрос")
-        chk_snmp_en.setChecked(current_cfg.get("snmp_enabled", False))
-        
-        in_snmp_ip = QLineEdit(current_cfg.get("snmp_ip", "192.168.1.100"))
-        in_snmp_port = QLineEdit(str(current_cfg.get("snmp_port", 161)))
-        
-        in_snmp_ver = QComboBox()
-        in_snmp_ver.addItems(["v1", "v2c"])
-        in_snmp_ver.setCurrentText(current_cfg.get("snmp_version", "v2c"))
-        
-        in_snmp_comm = QLineEdit(current_cfg.get("snmp_community", "public"))
-        
-        lay_snmp.addRow(chk_snmp_en)
-        lay_snmp.addRow("SNMP IP Телефона:", in_snmp_ip)
-        lay_snmp.addRow("SNMP Порт:", in_snmp_port)
-        lay_snmp.addRow("Версия:", in_snmp_ver)
-        lay_snmp.addRow("Комьюнити (Community):", in_snmp_comm)
-        
-        tabs.addTab(tab_snmp, "🌐 SNMP")
-
         main_layout.addWidget(tabs)
         
         btn_save = QPushButton("💾 Сохранить и Перезапустить Сервисы")
@@ -1194,12 +1120,7 @@ class PhoneApp(QMainWindow):
                 "pg_dbname": input_pg_dbname.text(), "pg_user": input_pg_user.text(), "pg_pass": input_pg_pass.text(),
                 "vnc_pg_host": in_v_host.text(), "vnc_pg_port": in_v_port.text(), "vnc_pg_dbname": in_v_name.text(),
                 "vnc_pg_user": in_v_user.text(), "vnc_pg_pass": in_v_pass.text(),
-                "vnc_owner": in_v_owner.text(),
-                "snmp_enabled": chk_snmp_en.isChecked(),
-                "snmp_ip": in_snmp_ip.text(),
-                "snmp_port": int(in_snmp_port.text()),
-                "snmp_version": in_snmp_ver.currentText(),
-                "snmp_community": in_snmp_comm.text()
+                "vnc_owner": in_v_owner.text()
             })
             save_config(current_cfg)
             self.db.config = current_cfg
@@ -1394,8 +1315,6 @@ class PhoneApp(QMainWindow):
         self.save_app_state()
         if self.syslog_thread:
             self.syslog_thread.running = False
-        if self.snmp_thread:
-            self.snmp_thread.running = False
         if self.http_thread:
             self.http_thread.running = False
         QApplication.quit()
