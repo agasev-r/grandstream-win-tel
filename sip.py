@@ -21,6 +21,8 @@ import socket
 import re
 import threading
 import quopri
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
 
 # --- ВНЕШНИЕ БИБЛИОТЕКИ С ПРОВЕРКОЙ ---
 try:
@@ -54,6 +56,7 @@ def load_config():
         "phone_ext": "101",
         "local_ip": "0.0.0.0", 
         "syslog_port": 514,
+        "http_port": 8080,
         
         "snmp_enabled": False,
         "snmp_ip": "192.168.1.100",
@@ -371,6 +374,65 @@ class SyslogWorker(QThread):
         self.is_talking = False
 
 # ==========================================
+#      HTTP ACTION URL ПАРСЕР
+# ==========================================
+class RequestHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+    def do_GET(self):
+        parsed_path = urlparse(self.path)
+        if parsed_path.path == '/call':
+            query = parse_qs(parsed_path.query)
+            status = query.get('status', [''])[0]
+            number = query.get('number', [''])[0]
+            direction = query.get('direction', ['IN'])[0]
+            
+            if hasattr(self.server, 'worker') and self.server.worker:
+                self.server.worker.handle_request(status, number, direction)
+            
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b"OK")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+class HttpWorker(QThread):
+    call_signal = pyqtSignal(str, str, str)
+    status_signal = pyqtSignal(str)
+    connection_status_signal = pyqtSignal(bool, str)
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.running = True
+        self.httpd = None
+
+    def handle_request(self, status, number, direction):
+        if status in ["IN", "OUT", "END", "MISSED"]:
+            self.call_signal.emit(status, number, direction)
+        elif status == "ANSWERED":
+            self.status_signal.emit("ANSWERED")
+
+    def run(self):
+        port = int(self.config.get("http_port", 8080))
+        try:
+            self.httpd = HTTPServer(('0.0.0.0', port), RequestHandler)
+            self.httpd.worker = self
+            self.connection_status_signal.emit(True, f"🌐 HTTP Сервер (Порт {port})")
+        except Exception as e:
+            self.connection_status_signal.emit(False, f"🔴 Ошибка HTTP: {e}")
+            return
+            
+        self.httpd.timeout = 0.5
+        while self.running:
+            self.httpd.handle_request()
+            
+        self.httpd.server_close()
+
+# ==========================================
 #      SNMP РАБОЧИЙ ПОТОК (ОПРОС СТАТУСА)
 # ==========================================
 class SnmpWorker(QThread):
@@ -565,6 +627,7 @@ class PhoneApp(QMainWindow):
         self.db = Database(self.config)
         self.syslog_thread = None
         self.snmp_thread = None
+        self.http_thread = None
         self.popup_window = None
         
         geo = self.config.get("window_geometry", [100, 100, 1250, 750])
@@ -945,6 +1008,10 @@ class PhoneApp(QMainWindow):
         if self.snmp_thread:
             self.snmp_thread.running = False
             self.snmp_thread.wait()
+            
+        if self.http_thread:
+            self.http_thread.running = False
+            self.http_thread.wait()
         
         self.syslog_thread = SyslogWorker(self.config)
         self.syslog_thread.connection_status_signal.connect(self.update_connection_status)
@@ -956,6 +1023,12 @@ class PhoneApp(QMainWindow):
         self.snmp_thread.status_signal.connect(lambda ok, msg: print(msg))
         self.snmp_thread.call_signal.connect(self.on_incoming_call)
         self.snmp_thread.start()
+        
+        self.http_thread = HttpWorker(self.config)
+        self.http_thread.connection_status_signal.connect(lambda ok, msg: print(msg))
+        self.http_thread.call_signal.connect(self.on_incoming_call)
+        self.http_thread.status_signal.connect(self.on_call_answered)
+        self.http_thread.start()
 
     def update_connection_status(self, is_ok, message):
         color = "#2ecc71" if is_ok else "#e74c3c"
@@ -1323,6 +1396,8 @@ class PhoneApp(QMainWindow):
             self.syslog_thread.running = False
         if self.snmp_thread:
             self.snmp_thread.running = False
+        if self.http_thread:
+            self.http_thread.running = False
         QApplication.quit()
 
 if __name__ == "__main__":
