@@ -1,0 +1,7 @@
+main.exe
+phonebook.db
+phone_settings.json
+build/
+__pycache__/
+*.pyc
+*.log
